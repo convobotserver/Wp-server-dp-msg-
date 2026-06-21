@@ -22,12 +22,26 @@ const __dirname  = path.dirname(__filename);
 const app  = express();
 const PORT = process.env.PORT || 5000;
 
-// Multer: accept multiple file fields
-const upload = multer({ dest: 'uploads/' });
+// ── Ensure required directories exist ──────────────────────────────────────────
+['./session', './uploads', './public'].forEach(dir => {
+  const full = path.resolve(__dirname, dir);
+  if (!fs.existsSync(full)) fs.mkdirSync(full, { recursive: true });
+});
 
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// ── Multer: store files in 'uploads' ────────────────────────────────────────
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, path.resolve(__dirname, 'uploads')),
+  filename: (req, file, cb) => {
+    const unique = crypto.randomBytes(8).toString('hex');
+    const ext = path.extname(file.originalname);
+    cb(null, `${Date.now()}-${unique}${ext}`);
+  }
+});
+const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
+
+app.use(cors({ origin: '*', credentials: true }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(express.static('public'));
 
 // ── In-memory state ───────────────────────────────────────────────────────────
@@ -63,7 +77,7 @@ const cleanupSession = (uniqueKey) => {
   delete activeSockets[uniqueKey];
 };
 
-// ── Core: Message Sender (non-stop loop) ──────────────────────────────────────
+// ── Core: Message Sender ──────────────────────────────────────────────────────
 const startMessaging = (MznKing, uniqueKey, target, hatersName, messages, speed) => {
   if (stopFlags[uniqueKey]?.interval) clearInterval(stopFlags[uniqueKey].interval);
 
@@ -106,7 +120,6 @@ const startMessaging = (MznKing, uniqueKey, target, hatersName, messages, speed)
 
       queue.currentIndex++;
       if (queue.currentIndex >= queue.messages.length) {
-        // Restart from beginning — non-stop loop
         console.log(chalk.cyan(`🔄 All messages done — restarting loop`));
         queue.currentIndex = 0;
       }
@@ -124,7 +137,7 @@ const startMessaging = (MznKing, uniqueKey, target, hatersName, messages, speed)
   sendNext();
 };
 
-// ── Core: Photo Sender (non-stop loop) ───────────────────────────────────────
+// ── Core: Photo Sender ───────────────────────────────────────────────────────
 const startPhotoSending = (MznKing, uniqueKey, target, caption, photoItems, speed) => {
   if (stopFlags[uniqueKey]?.interval) clearInterval(stopFlags[uniqueKey].interval);
 
@@ -163,8 +176,10 @@ const startPhotoSending = (MznKing, uniqueKey, target, caption, photoItems, spee
       if (item.startsWith('http://') || item.startsWith('https://')) {
         imagePayload = { url: item };
       } else {
-        if (!fs.existsSync(item)) throw new Error(`File not found: ${item}`);
-        imagePayload = fs.readFileSync(item);
+        // If it's a local path, resolve it relative to project root
+        const filePath = path.resolve(__dirname, item);
+        if (!fs.existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
+        imagePayload = fs.readFileSync(filePath);
       }
 
       await MznKing.sendMessage(chatId, {
@@ -184,7 +199,6 @@ const startPhotoSending = (MznKing, uniqueKey, target, caption, photoItems, spee
     } catch (err) {
       sessionStats[uniqueKey].failed++;
       console.error(chalk.red(`❌ Photo send failed: ${err.message}`));
-      // Skip to next on error
       queue.currentIndex++;
       if (queue.currentIndex >= queue.items.length) queue.currentIndex = 0;
     } finally {
@@ -198,7 +212,7 @@ const startPhotoSending = (MznKing, uniqueKey, target, caption, photoItems, spee
   sendNext();
 };
 
-// ── Core: Sticker Sender (non-stop loop) ─────────────────────────────────────
+// ── Core: Sticker Sender ─────────────────────────────────────────────────────
 const startStickerSending = (MznKing, uniqueKey, target, stickerPath, speed) => {
   if (stopFlags[uniqueKey]?.interval) clearInterval(stopFlags[uniqueKey].interval);
 
@@ -221,8 +235,9 @@ const startStickerSending = (MznKing, uniqueKey, target, stickerPath, speed) => 
     }
 
     try {
-      if (!fs.existsSync(stickerPath)) throw new Error(`Sticker file missing: ${stickerPath}`);
-      const stickerBuffer = fs.readFileSync(stickerPath);
+      const filePath = path.resolve(__dirname, stickerPath);
+      if (!fs.existsSync(filePath)) throw new Error(`Sticker file missing: ${filePath}`);
+      const stickerBuffer = fs.readFileSync(filePath);
 
       await MznKing.sendMessage(chatId, { sticker: stickerBuffer });
 
@@ -275,7 +290,6 @@ const connectAndLogin = async (phoneNumber, uniqueKey, sendPairingCode = null) =
 
       activeSockets[uniqueKey] = MznKing;
 
-      // Request pairing code for new sessions
       if (!MznKing.authState.creds.registered && !pairingCodeSent && sendPairingCode) {
         await new Promise(r => setTimeout(r, 2000));
         try {
@@ -322,7 +336,6 @@ const connectAndLogin = async (phoneNumber, uniqueKey, sendPairingCode = null) =
             sendPairingCode(null, true);
           }
 
-          // Resume messaging if session had active task
           const sess = userSessions[uniqueKey];
 
           if (sess?.messaging && sess?.messages) {
@@ -445,6 +458,11 @@ const restoreSessions = async () => {
 //  ROUTES
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// ── GET /ping ── Health check ──────────────────────────────────────────────
+app.get('/ping', (req, res) => {
+  res.json({ success: true, message: 'Server is alive!', timestamp: Date.now() });
+});
+
 // ── POST /login ───────────────────────────────────────────────────────────────
 app.post('/login', async (req, res) => {
   try {
@@ -524,7 +542,6 @@ app.post('/startMessaging', upload.single('messageFile'), async (req, res) => {
 
     const MznKing = activeSockets[uniqueKey];
 
-    // Stop any active process first
     if (stopFlags[uniqueKey]?.interval) {
       stopFlags[uniqueKey].stopped = true;
       clearInterval(stopFlags[uniqueKey].interval);
@@ -555,6 +572,8 @@ app.post('/startPhotoSending', upload.fields([
   try {
     const { uniqueKey, target, caption, speed, mode } = req.body;
 
+    console.log(chalk.cyan(`📸 Photo request: ${uniqueKey}, mode=${mode}, target=${target}`));
+
     if (!uniqueKey || !target || !speed)
       return res.status(400).json({ success: false, message: 'Missing required fields!' });
     if (!userSessions[uniqueKey])
@@ -569,10 +588,11 @@ app.post('/startPhotoSending', upload.fields([
       if (!photoFile)
         return res.status(400).json({ success: false, message: 'No photo file uploaded!' });
 
-      // Move to persistent location so it can be re-used on reconnect
-      const destPath = `./uploads/photo_${uniqueKey}${path.extname(photoFile.originalname)}`;
+      // Move to persistent location
+      const destPath = path.resolve(__dirname, `uploads/photo_${uniqueKey}${path.extname(photoFile.originalname)}`);
       fs.renameSync(photoFile.path, destPath);
       photoItems = [destPath];
+      console.log(chalk.green(`📸 Single photo saved: ${destPath}`));
 
     } else {
       // Multi mode: read txt list
@@ -585,6 +605,7 @@ app.post('/startPhotoSending', upload.fields([
         photoItems = content.split('\n').map(l => l.trim()).filter(l => l.length > 0);
         if (photoItems.length === 0)
           return res.status(400).json({ success: false, message: 'Photo list file is empty!' });
+        console.log(chalk.green(`📸 Loaded ${photoItems.length} photo entries from list`));
       } finally {
         try { fs.unlinkSync(listFile.path); } catch (e) {}
       }
@@ -592,7 +613,6 @@ app.post('/startPhotoSending', upload.fields([
 
     const MznKing = activeSockets[uniqueKey];
 
-    // Stop any active process first
     if (stopFlags[uniqueKey]?.interval) {
       stopFlags[uniqueKey].stopped = true;
       clearInterval(stopFlags[uniqueKey].interval);
@@ -611,6 +631,7 @@ app.post('/startPhotoSending', upload.fields([
 
     res.json({ success: true, message: 'Photo sending started!', uniqueKey, photoCount: photoItems.length, target });
   } catch (error) {
+    console.error(chalk.red(`❌ Photo route error: ${error.message}`));
     res.status(500).json({ success: false, message: `Server Error: ${error.message}` });
   }
 });
@@ -619,6 +640,8 @@ app.post('/startPhotoSending', upload.fields([
 app.post('/startStickerSending', upload.single('stickerFile'), async (req, res) => {
   try {
     const { uniqueKey, target, speed } = req.body;
+
+    console.log(chalk.cyan(`🎭 Sticker request: ${uniqueKey}, target=${target}`));
 
     if (!uniqueKey || !target || !speed)
       return res.status(400).json({ success: false, message: 'Missing required fields!' });
@@ -632,12 +655,12 @@ app.post('/startStickerSending', upload.single('stickerFile'), async (req, res) 
       return res.status(400).json({ success: false, message: 'No sticker file uploaded!' });
 
     // Move to persistent location
-    const destPath = `./uploads/sticker_${uniqueKey}${path.extname(stickerFile.originalname || '.webp')}`;
+    const destPath = path.resolve(__dirname, `uploads/sticker_${uniqueKey}${path.extname(stickerFile.originalname || '.webp')}`);
     fs.renameSync(stickerFile.path, destPath);
+    console.log(chalk.green(`🎭 Sticker saved: ${destPath}`));
 
     const MznKing = activeSockets[uniqueKey];
 
-    // Stop any active process first
     if (stopFlags[uniqueKey]?.interval) {
       stopFlags[uniqueKey].stopped = true;
       clearInterval(stopFlags[uniqueKey].interval);
@@ -656,6 +679,7 @@ app.post('/startStickerSending', upload.single('stickerFile'), async (req, res) 
 
     res.json({ success: true, message: 'Sticker sending started!', uniqueKey, target });
   } catch (error) {
+    console.error(chalk.red(`❌ Sticker route error: ${error.message}`));
     res.status(500).json({ success: false, message: `Server Error: ${error.message}` });
   }
 });
@@ -704,7 +728,7 @@ app.post('/stop', async (req, res) => {
 
     // Cleanup uploaded files for this session
     ['photo', 'sticker'].forEach(type => {
-      const pat = `./uploads/${type}_${uniqueKey}`;
+      const pat = path.resolve(__dirname, `uploads/${type}_${uniqueKey}`);
       [pat + '.jpg', pat + '.png', pat + '.webp', pat + '.gif'].forEach(fp => {
         try { if (fs.existsSync(fp)) fs.unlinkSync(fp); } catch (e) {}
       });
@@ -732,12 +756,8 @@ app.listen(PORT, '0.0.0.0', async () => {
   console.log(chalk.green(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`));
   console.log(chalk.green(`✅ VEER Server running on port ${PORT}`));
   console.log(chalk.cyan(`🌐 CORS enabled for all origins`));
+  console.log(chalk.cyan(`🔗 Test: http://localhost:${PORT}/ping`));
   console.log(chalk.green(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`));
-
-  // Ensure directories exist
-  ['./session', './uploads', './public'].forEach(dir => {
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  });
 
   await restoreSessions();
 });
